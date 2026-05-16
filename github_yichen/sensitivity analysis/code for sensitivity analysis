@@ -1,0 +1,831 @@
+%matplotlib inline
+
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+from scipy.interpolate import interp1d
+from scipy.optimize import curve_fit
+
+# ==============================================================================
+# TMM Simulator
+# ==============================================================================
+class KLA_Material_Loader:
+    def __init__(self, wavelengths):
+        self.target_wl = wavelengths
+        self.materials = {}
+
+    def load_from_file(self, filename, mat_name):
+        if not os.path.exists(filename):
+            print(f"[WARNING] File not found: {filename}. Using default for {mat_name}.")
+            return False
+        try:
+            data = []
+            with open(filename, 'r') as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if not parts: continue
+                    if parts[0].replace('.', '', 1).isdigit() and len(parts) >= 3:
+                        data.append([float(parts[0]), float(parts[1]), float(parts[2])])
+            data = np.array(data)
+            data = data[data[:, 0].argsort()]
+            f_n = interp1d(data[:, 0], data[:, 1], kind='linear', fill_value="extrapolate")
+            f_k = interp1d(data[:, 0], data[:, 2], kind='linear', fill_value="extrapolate")
+            self.materials[mat_name] = f_n(self.target_wl) + 1j * f_k(self.target_wl)
+            return True
+        except Exception as e:
+            print(f"[ERROR] {filename}: {e}")
+            return False
+
+    def get_refractive_index(self, name):
+        return self.materials.get(name)
+
+
+class TMM_Simulator_7Layer:
+    def __init__(self, data_dir='../simulator/data'):
+        self.wavelengths = np.arange(200, 1001, 1.0)
+        self.k0_list     = 2 * np.pi / self.wavelengths
+        self.loader      = KLA_Material_Loader(self.wavelengths)
+        print("Loading KLA material library...")
+        self.has_si    = self.loader.load_from_file(os.path.join(data_dir, 'si.txt'),    'Si')
+        self.has_sio2  = self.loader.load_from_file(os.path.join(data_dir, 'sio2.txt'),  'SiO2')
+        self.has_si3n4 = self.loader.load_from_file(os.path.join(data_dir, 'si3n4.txt'), 'Si3N4')
+        self.n_Air   = np.ones_like(self.wavelengths, dtype=np.complex128)
+        self.n_SiO2  = self.loader.get_refractive_index('SiO2')
+        if self.n_SiO2  is None: self.n_SiO2  = np.full_like(self.wavelengths, 1.46+0j, dtype=np.complex128)
+        self.n_Si3N4 = self.loader.get_refractive_index('Si3N4')
+        if self.n_Si3N4 is None: self.n_Si3N4 = np.full_like(self.wavelengths, 2.02+0j, dtype=np.complex128)
+        self.n_Si    = self.loader.get_refractive_index('Si')
+        if self.n_Si    is None: self.n_Si    = np.full_like(self.wavelengths, 4.00+0j, dtype=np.complex128)
+        print("Material library loaded.\n")
+
+    def calculate_spectrum(self, d_list):
+        layers = [
+            (self.n_Air,   0),
+            (self.n_SiO2,  d_list[0]), (self.n_Si3N4, d_list[1]),
+            (self.n_SiO2,  d_list[2]), (self.n_Si3N4, d_list[3]),
+            (self.n_SiO2,  d_list[4]), (self.n_Si3N4, d_list[5]),
+            (self.n_SiO2,  d_list[6]), (self.n_Si,    0),
+        ]
+        M00 = np.ones_like(self.wavelengths,  dtype=np.complex128)
+        M11 = np.ones_like(self.wavelengths,  dtype=np.complex128)
+        M01 = np.zeros_like(self.wavelengths, dtype=np.complex128)
+        M10 = np.zeros_like(self.wavelengths, dtype=np.complex128)
+        N_curr = layers[0][0]
+        for i in range(1, len(layers)):
+            N_next, d_next = layers[i]
+            r     = (N_curr - N_next) / (N_curr + N_next)
+            inv_t = (N_curr + N_next) / (2 * N_curr)
+            m00=(M00+M01*r)*inv_t; m01=(M00*r+M01)*inv_t
+            m10=(M10+M11*r)*inv_t; m11=(M10*r+M11)*inv_t
+            M00,M01,M10,M11 = m00,m01,m10,m11
+            if i < len(layers)-1:
+                phi = self.k0_list * N_next * d_next
+                M00*=np.exp(-1j*phi); M01*=np.exp(1j*phi)
+                M10*=np.exp(-1j*phi); M11*=np.exp(1j*phi)
+            N_curr = N_next
+        return np.abs(M10/M00)**2
+
+
+# ==============================================================================
+# Helper functions
+# ==============================================================================
+def compute_rmse_pct(spec_ref, spec_perturbed):
+    rmse = np.sqrt(np.mean((spec_perturbed - spec_ref)**2))
+    return rmse / np.mean(spec_ref) * 100
+
+def quadratic_full(x, a, b):
+    return a * x**2 + b
+
+def linear_abs(x, a, b):
+    return a * x + b
+
+def check_monotonic(delta_range, rmse_values, threshold):
+    mask      = ~np.isnan(rmse_values)
+    delta_c   = delta_range[mask]
+    rmse_c    = rmse_values[mask]
+    in_thresh = rmse_c < threshold
+    if in_thresh.sum() < 3:
+        return False, False, False
+    delta_r = delta_c[in_thresh]
+    rmse_r  = rmse_c[in_thresh]
+    left_ok = right_ok = True
+    left_mask = delta_r < 0
+    if left_mask.sum() > 1:
+        idx = np.argsort(delta_r[left_mask])
+        left_ok = bool(np.all(np.diff(rmse_r[left_mask][idx]) <= 0))
+    right_mask = delta_r > 0
+    if right_mask.sum() > 1:
+        idx = np.argsort(delta_r[right_mask])
+        right_ok = bool(np.all(np.diff(rmse_r[right_mask][idx]) >= 0))
+    return left_ok and right_ok, left_ok, right_ok
+
+def find_x_limit(simulator, ref_thicknesses, layer_idx, ref_thickness,
+                 max_rmse=10.0, delta_check=np.arange(-50, 51, 1)):
+    ref_spec = simulator.calculate_spectrum(ref_thicknesses)
+    rmse_vals = []
+    for delta in delta_check:
+        perturbed = ref_thicknesses.copy()
+        perturbed[layer_idx] = ref_thickness + delta
+        if perturbed[layer_idx] <= 0:
+            rmse_vals.append(np.nan); continue
+        rmse_vals.append(compute_rmse_pct(ref_spec, simulator.calculate_spectrum(perturbed)))
+    rmse_vals = np.array(rmse_vals)
+    within = np.where(rmse_vals <= max_rmse)[0]
+    if len(within) > 0:
+        return max(abs(delta_check[within[0]]), abs(delta_check[within[-1]]))
+    return 20
+
+def compute_heatmap(simulator, ref_thicknesses, ref_spectrum,
+                    idx_a, ref_a, idx_b, ref_b, lim_a, lim_b, step=1):
+    da = np.arange(-lim_a, lim_a+1, step)
+    db = np.arange(-lim_b, lim_b+1, step)
+    hm = np.zeros((len(da), len(db)))
+    for i, d1 in enumerate(da):
+        for j, d2 in enumerate(db):
+            perturbed = ref_thicknesses.copy()
+            perturbed[idx_a] = ref_a + d1
+            perturbed[idx_b] = ref_b + d2
+            if perturbed[idx_a] <= 0 or perturbed[idx_b] <= 0:
+                hm[i,j] = np.nan
+            else:
+                hm[i,j] = compute_rmse_pct(ref_spectrum, simulator.calculate_spectrum(perturbed))
+        if i % 5 == 0: print(f'  Row {i+1}/{len(da)} done')
+    return da, db, hm
+
+def plot_heatmap(ax, da, db, hm, name_a, name_b, title, zoom_y_max=10.0):
+    im = ax.imshow(hm, extent=[db[0],db[-1],da[0],da[-1]], origin='lower',
+                   aspect='auto', cmap='RdYlGn_r', vmin=0, vmax=zoom_y_max)
+    plt.colorbar(im, ax=ax, label='RMSE (%)')
+    try:
+        cs3 = ax.contour(db, da, hm, levels=[3.0], colors=['red'], linewidths=2)
+        ax.clabel(cs3, fmt='3%%', fontsize=9)
+    except: pass
+    try:
+        cs5 = ax.contour(db, da, hm, levels=[5.0], colors=['orange'], linewidths=2)
+        ax.clabel(cs5, fmt='5%%', fontsize=9)
+    except: pass
+    ax.axhline(y=0, color='white', linestyle='--', linewidth=1, alpha=0.5)
+    ax.axvline(x=0, color='white', linestyle='--', linewidth=1, alpha=0.5)
+    ax.plot(0, 0, 'w*', markersize=12, label='Reference (RMSE=0)', zorder=5)
+    ax.set_xlabel(f'ΔL of {name_b} (nm)', fontsize=11)
+    ax.set_ylabel(f'ΔL of {name_a} (nm)', fontsize=11)
+    ax.set_title(title, fontsize=11); ax.legend(fontsize=9)
+    return im
+
+
+# ==============================================================================
+# Setup — initialise simulator and shared variables
+# ==============================================================================
+# Define once, use in every graph title
+ref_title = '  |  '.join([f'{layer_names[i]}: {ref_thicknesses[i]:.0f}nm'
+                           for i in range(7)])
+# Result: "thk_SiO2_1: 1000nm  |  thk_Si3N4_1: 100nm  |  ..."
+simulator = TMM_Simulator_7Layer(data_dir='.')  # change path to your data folder
+
+ref_thicknesses = [1000.0, 100.0, 1000.0, 100.0, 1000.0, 100.0, 1000.0]
+layer_names     = ['thk_SiO2_1', 'thk_Si3N4_1', 'thk_SiO2_2',
+                   'thk_Si3N4_2', 'thk_SiO2_3',  'thk_Si3N4_3', 'thk_SiO2_4']
+
+# ── test_examples defined ONCE as tuples (thicknesses, label) ─────────────────
+# Used consistently in ALL cells below — no need for a separate example_labels list
+test_examples = [
+    ([1000.0, 100.0, 1000.0, 100.0, 1000.0, 100.0, 1000.0], 'SiO2=1000, Si3N4=100 (original)'),
+    ([500.0,   50.0,  500.0,  50.0,  500.0,  50.0,  500.0], 'SiO2=500,  Si3N4=50  (half)'),
+    ([200.0,  200.0,  200.0, 200.0,  200.0, 200.0,  200.0], 'SiO2=200,  Si3N4=200 (equal)'),
+    ([800.0,  150.0,  600.0, 120.0,  400.0,  80.0,  700.0], 'Mixed A'),
+    ([300.0,   80.0,  450.0,  60.0,  600.0, 110.0,  250.0], 'Mixed B'),
+]
+
+delta_range_nm  = np.arange(-100, 101, 1)
+delta_range_pct = np.arange(-50,   51, 1)
+threshold_1     = 5.0
+threshold_2     = 3.0
+ZOOM_Y_MAX      = 10.0
+MONO_THRESH     = 5.0
+
+colors_layers = ['#1f77b4','#ff7f0e','#2ca02c','#d62728','#9467bd','#8c564b','#e377c2']
+linestyles    = ['-', '-', '--', '--', '-.', '-.', ':']
+
+os.makedirs('./sensitivity_plots', exist_ok=True)
+ref_spectrum = simulator.calculate_spectrum(ref_thicknesses)
+print("Reference spectrum computed. Reference: SiO2=1000nm, Si3N4=100nm")
+
+
+# ==============================================================================
+# Cell 8: 1nm step sensitivity graphs
+# ==============================================================================
+print("\nComputing 1nm step sensitivity curves...")
+fig1, axes1 = plt.subplots(4, 2, figsize=(14, 20))
+axes1 = axes1.flatten()
+for layer_idx in range(7):
+    ax = axes1[layer_idx]; name = layer_names[layer_idx]; ref = ref_thicknesses[layer_idx]
+    rmse_values = []
+    for delta in delta_range_nm:
+        perturbed = ref_thicknesses.copy(); perturbed[layer_idx] = ref + delta
+        if perturbed[layer_idx] <= 0: rmse_values.append(np.nan); continue
+        rmse_values.append(compute_rmse_pct(ref_spectrum, simulator.calculate_spectrum(perturbed)))
+    rmse_values = np.array(rmse_values)
+    ax.plot(delta_range_nm, rmse_values, 'b-', linewidth=2, label='RMSE%')
+    ax.axhline(y=threshold_1, color='orange', linestyle='--', linewidth=1.5, label=f'{threshold_1}% threshold')
+    ax.axhline(y=threshold_2, color='red',    linestyle='--', linewidth=1.5, label=f'{threshold_2}% threshold')
+    ax.axvline(x=0, color='grey', linestyle=':', linewidth=1, alpha=0.7)
+    for thresh, color in [(threshold_1,'orange'), (threshold_2,'red')]:
+        within = np.where(rmse_values <= thresh)[0]
+        if len(within) > 0:
+            ax.axvspan(delta_range_nm[within[0]], delta_range_nm[within[-1]], alpha=0.08, color=color)
+    ax.set_xlabel('ΔL (nm)', fontsize=11); ax.set_ylabel('RMSE (%)', fontsize=11)
+    ax.set_title(f'Layer {layer_idx+1}: {name}\n(ref = {ref} nm)', fontsize=12)
+    ax.legend(fontsize=9); ax.grid(True, alpha=0.3)
+    print(f"  {name} done")
+axes1[7].axis('off')
+fig1.suptitle(f'Sensitivity Analysis — 1nm Step Resolution\n{ref_title}',
+              fontsize=12, fontweight='bold')
+# fig1.suptitle('Sensitivity Analysis — 1nm Step Resolution\nReference: SiO2=1000nm, Si3N4=100nm',
+#               fontsize=14, fontweight='bold')
+fig1.tight_layout(); fig1.savefig('./sensitivity_plots/sensitivity_1nm_step.png', dpi=150, bbox_inches='tight')
+plt.show(); print("Saved: sensitivity_1nm_step.png")
+
+# Summary table
+print("\n" + "="*70)
+print(f"{'Layer':<20} {'Ref (nm)':>10} {'ΔL within 5%':>22} {'ΔL within 3%':>22}")
+print("-"*70)
+for layer_idx in range(7):
+    name = layer_names[layer_idx]; ref = ref_thicknesses[layer_idx]
+    rmse_values = []
+    for delta in delta_range_nm:
+        perturbed = ref_thicknesses.copy(); perturbed[layer_idx] = ref + delta
+        if perturbed[layer_idx] <= 0: rmse_values.append(np.nan); continue
+        rmse_values.append(compute_rmse_pct(ref_spectrum, simulator.calculate_spectrum(perturbed)))
+    rmse_values = np.array(rmse_values)
+    r5 = r3 = "none"
+    for thresh, lbl in [(threshold_1,'5%'), (threshold_2,'3%')]:
+        within = np.where(rmse_values <= thresh)[0]
+        rng = f"[{delta_range_nm[within[0]]:+.0f}, {delta_range_nm[within[-1]]:+.0f}] nm" if len(within) > 0 else "none"
+        if lbl == '5%': r5 = rng
+        else:           r3 = rng
+    print(f"{name:<20} {ref:>10.0f} {r5:>22} {r3:>22}")
+print("="*70)
+
+
+# ==============================================================================
+# Cell 9: 1% step sensitivity graphs
+# ==============================================================================
+print("\nComputing 1% step sensitivity curves...")
+fig2, axes2 = plt.subplots(4, 2, figsize=(14, 20))
+axes2 = axes2.flatten()
+for layer_idx in range(7):
+    ax = axes2[layer_idx]; name = layer_names[layer_idx]; ref = ref_thicknesses[layer_idx]
+    delta_nm_from_pct = delta_range_pct * ref / 100.0
+    rmse_values = []
+    for delta_nm in delta_nm_from_pct:
+        perturbed = ref_thicknesses.copy(); perturbed[layer_idx] = ref + delta_nm
+        if perturbed[layer_idx] <= 0: rmse_values.append(np.nan); continue
+        rmse_values.append(compute_rmse_pct(ref_spectrum, simulator.calculate_spectrum(perturbed)))
+    rmse_values = np.array(rmse_values)
+    ax.plot(delta_range_pct, rmse_values, 'g-', linewidth=2, label='RMSE%')
+    ax.axhline(y=threshold_1, color='orange', linestyle='--', linewidth=1.5, label=f'{threshold_1}% threshold')
+    ax.axhline(y=threshold_2, color='red',    linestyle='--', linewidth=1.5, label=f'{threshold_2}% threshold')
+    ax.axvline(x=0, color='grey', linestyle=':', linewidth=1, alpha=0.7)
+    for thresh, color in [(threshold_1,'orange'), (threshold_2,'red')]:
+        within = np.where(rmse_values <= thresh)[0]
+        if len(within) > 0:
+            ax.axvspan(delta_range_pct[within[0]], delta_range_pct[within[-1]], alpha=0.08, color=color)
+    ax.set_xlabel('ΔL (%)', fontsize=11); ax.set_ylabel('RMSE (%)', fontsize=11)
+    ax.set_title(f'Layer {layer_idx+1}: {name}\n(ref = {ref} nm,  1% step = {ref/100:.1f} nm)', fontsize=12)
+    ax.legend(fontsize=9); ax.grid(True, alpha=0.3)
+    print(f"  {name} done")
+axes2[7].axis('off')
+# fig2.suptitle('Sensitivity Analysis — 1% Step Resolution\nReference: SiO2=1000nm, Si3N4=100nm',
+#               fontsize=14, fontweight='bold')
+fig2.suptitle(f'Sensitivity Analysis — 1% Step Resolution\n{ref_title}',
+              fontsize=12, fontweight='bold')
+fig2.tight_layout(); fig2.savefig('./sensitivity_plots/sensitivity_1pct_step.png', dpi=150, bbox_inches='tight')
+plt.show(); print("Saved: sensitivity_1pct_step.png")
+
+
+# ==============================================================================
+# Cell 10: Monotonicity text check — multiple reference examples
+# ==============================================================================
+delta_check = np.arange(-100, 101, 1)
+print(f'\nMonotonicity check — RMSE threshold: {MONO_THRESH}%')
+all_results = []
+for ex_idx, (ref_t, ex_label) in enumerate(test_examples):
+    ref_spec_ex = simulator.calculate_spectrum(ref_t)
+    row = {'example': ex_label}; mono_count = 0
+    for layer_idx in range(7):
+        name = layer_names[layer_idx]; ref = ref_t[layer_idx]
+        rmse_vals = []
+        for delta in delta_check:
+            perturbed = ref_t.copy(); perturbed[layer_idx] = ref + delta
+            if perturbed[layer_idx] <= 0: rmse_vals.append(np.nan); continue
+            rmse_vals.append(compute_rmse_pct(ref_spec_ex, simulator.calculate_spectrum(perturbed)))
+        rmse_vals = np.array(rmse_vals)
+        is_mono, left_ok, right_ok = check_monotonic(delta_check, rmse_vals, MONO_THRESH)
+        row[name] = {'monotonic': is_mono, 'left': left_ok, 'right': right_ok}
+        if is_mono: mono_count += 1
+    row['mono_count'] = mono_count; all_results.append(row)
+    status = '✅' if mono_count == 7 else f'⚠️ {mono_count}/7'
+    print(f'\nExample {ex_idx+1}: {ex_label}  →  {status}')
+    for layer_idx in range(7):
+        name = layer_names[layer_idx]; r = row[name]
+        sym = '✅' if r['monotonic'] else ('⚠️ left only' if r['left'] else ('⚠️ right only' if r['right'] else '❌'))
+        print(f'    {name:<15}: {sym}')
+total_mono = sum(r['mono_count'] for r in all_results)
+total_checks = len(test_examples) * 7
+pct_mono = total_mono / total_checks * 100
+print(f'\nOVERALL: {total_mono}/{total_checks} = {pct_mono:.1f}% monotonic within RMSE < {MONO_THRESH}%')
+print('✅ Confirmed.' if pct_mono >= 90 else '⚠️ Check exceptions.')
+
+
+# ==============================================================================
+# Cell 10a: Visual monotonicity — all layers on one graph per example (|ΔL| version)
+# ==============================================================================
+MONO_DELTA = np.arange(0, 15.1, 0.1)
+fig_mono, axes_mono = plt.subplots(3, 2, figsize=(16, 18))
+axes_mono = axes_mono.flatten()
+for ex_idx, (ref_t, ex_label) in enumerate(test_examples):
+    ax = axes_mono[ex_idx]
+    ref_spec_ex = simulator.calculate_spectrum(ref_t)
+    all_mono = True
+    for layer_idx in range(7):
+        name = layer_names[layer_idx]; ref = ref_t[layer_idx]
+        rmse_vals = []
+        for delta in MONO_DELTA:
+            perturbed = ref_t.copy(); perturbed[layer_idx] = ref + delta
+            if perturbed[layer_idx] <= 0: rmse_vals.append(np.nan); continue
+            rmse_vals.append(compute_rmse_pct(ref_spec_ex, simulator.calculate_spectrum(perturbed)))
+        rmse_vals = np.array(rmse_vals)
+        within = rmse_vals <= MONO_THRESH
+        x_plot = MONO_DELTA[within] if within.sum() > 0 else MONO_DELTA[:2]
+        y_plot = rmse_vals[within]  if within.sum() > 0 else rmse_vals[:2]
+        mask_valid = ~np.isnan(y_plot)
+        is_mono = bool(np.all(np.diff(y_plot[mask_valid]) >= -0.01)) if mask_valid.sum() > 1 else True
+        if not is_mono: all_mono = False
+        ax.plot(x_plot, y_plot, color=colors_layers[layer_idx], linestyle=linestyles[layer_idx],
+                linewidth=2.0 if is_mono else 3.5,
+                label=f'{name} (ref={ref:.0f}nm){"  ⚠️" if not is_mono else ""}')
+    ax.set_facecolor('#1a472a' if all_mono else '#5c1010')
+    ax.axhline(y=5.0, color='orange', linestyle='--', linewidth=1.5, label='5%', alpha=0.8)
+    ax.axhline(y=3.0, color='red',    linestyle=':',  linewidth=1.5, label='3%', alpha=0.8)
+    ax.text(0.02, 0.97, '✅ All monotonic' if all_mono else '❌ Non-monotonic detected',
+            transform=ax.transAxes, fontsize=10, fontweight='bold',
+            color='lightgreen' if all_mono else 'salmon', va='top', ha='left')
+    ax.set_xlabel('|ΔL| (nm)', fontsize=10); ax.set_ylabel('RMSE (%)', fontsize=10)
+    ax.set_title(f'Example {ex_idx+1}: {ex_label}', fontsize=11)
+    ax.set_ylim(0, MONO_THRESH+0.5); ax.set_xlim(0, MONO_DELTA[-1])
+    ax.legend(fontsize=7, loc='upper left'); ax.grid(True, alpha=0.2, color='white')
+axes_mono[5].axis('off')
+# fig_mono.suptitle('Visual Monotonicity Check — |ΔL|\nGreen = all monotonic ✅  |  Red = issue ❌',
+#                   fontsize=13, fontweight='bold')
+fig_mono.suptitle(f'Visual Monotonicity Check — |ΔL|\n{ref_title}\n'
+                  f'Green = all monotonic ✅  |  Red = issue ❌',
+                  fontsize=11, fontweight='bold')
+fig_mono.tight_layout(); fig_mono.savefig('./sensitivity_plots/monotonicity_visual.png', dpi=150, bbox_inches='tight')
+plt.show(); print("Saved: monotonicity_visual.png")
+
+
+# ==============================================================================
+# Cell 10b: Visual monotonicity — full two-sided ΔL
+# ==============================================================================
+MONO_DELTA_2S = np.arange(-15, 15.1, 0.1)
+for ex_idx, (ref_t, ex_label) in enumerate(test_examples):
+    ref_spec_ex = simulator.calculate_spectrum(ref_t)
+    fig_m, axes_m = plt.subplots(4, 2, figsize=(14, 22)); axes_m = axes_m.flatten()
+    example_all_mono = True
+    for layer_idx in range(7):
+        ax = axes_m[layer_idx]; name = layer_names[layer_idx]; ref = ref_t[layer_idx]
+        rmse_vals = []
+        for delta in MONO_DELTA_2S:
+            perturbed = ref_t.copy(); perturbed[layer_idx] = ref + delta
+            if perturbed[layer_idx] <= 0: rmse_vals.append(np.nan); continue
+            rmse_vals.append(compute_rmse_pct(ref_spec_ex, simulator.calculate_spectrum(perturbed)))
+        rmse_vals = np.array(rmse_vals)
+        within = np.where(rmse_vals <= MONO_THRESH)[0]
+        x_plot = MONO_DELTA_2S[within] if len(within) > 0 else MONO_DELTA_2S
+        y_plot = rmse_vals[within]     if len(within) > 0 else rmse_vals
+        left_mono = right_mono = True
+        if (x_plot < 0).sum() > 1: left_mono  = bool(np.all(np.diff(y_plot[x_plot < 0]) <= 0.01))
+        if (x_plot > 0).sum() > 1: right_mono = bool(np.all(np.diff(y_plot[x_plot > 0]) >= -0.01))
+        is_mono = left_mono and right_mono
+        if not is_mono: example_all_mono = False
+        ax.plot(x_plot, y_plot, color=colors_layers[layer_idx], linewidth=2.0,
+                label=f'{name} (ref={ref:.0f}nm)')
+        ax.axhline(y=5.0, color='orange', linestyle='--', linewidth=1.5, label='5% threshold')
+        ax.axhline(y=3.0, color='red',    linestyle=':',  linewidth=1.5, label='3% threshold')
+        ax.axvline(x=0,   color='grey',   linestyle=':',  linewidth=1.0, alpha=0.6)
+        ax.text(0.02, 0.97,
+                '✅ Happy face — monotonic' if is_mono else '❌ Sad face — non-monotonic!',
+                transform=ax.transAxes, fontsize=9, fontweight='bold',
+                color='lightgreen' if is_mono else 'salmon', va='top', ha='left')
+        ax.set_xlabel('ΔL (nm)', fontsize=11); ax.set_ylabel('RMSE (%)', fontsize=11)
+        ax.set_ylim(0, MONO_THRESH+0.5)
+        ax.set_title(f'Layer {layer_idx+1}: {name}  (ref={ref:.0f}nm)', fontsize=11)
+        ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
+    axes_m[7].axis('off')
+    overall_status = '✅ All monotonic' if example_all_mono else '❌ Some non-monotonic!'
+    # fig_m.suptitle(f'Monotonicity Check — Example {ex_idx+1}: {ex_label}\n'
+    #                f'Within 0–{MONO_THRESH}% RMSE region   |   {overall_status}',
+    #                fontsize=13, fontweight='bold')
+    # Inside the for loop, replace fig_m.suptitle(...) with:
+    ref_title_ex = '  |  '.join([f'{layer_names[i]}: {ref_t[i]:.0f}nm'
+                                  for i in range(7)])
+    fig_m.suptitle(f'Monotonicity Check — Example {ex_idx+1}: {ex_label}\n'
+                   f'{ref_title_ex}\n'
+                   f'Within 0–{MONO_THRESH}% RMSE region   |   {overall_status}',
+                   fontsize=11, fontweight='bold')
+
+    fig_m.tight_layout()
+    save_path = f'./sensitivity_plots/monotonicity_example{ex_idx+1}.png'
+    fig_m.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.show(); print(f'Saved: {save_path}  |  {overall_status}')
+
+
+# ==============================================================================
+# Cell 12: Zoomed graphs — 0-10% RMSE, x-axis auto-cropped, no fitted curve
+# ==============================================================================
+print('\n=== Zoomed Sensitivity Graphs (0-10% RMSE region) ===')
+ZOOM_DELTA = np.arange(-50, 50.1, 0.1)
+fig_z, axes_z = plt.subplots(4, 2, figsize=(14, 22)); axes_z = axes_z.flatten()
+zoom_sensitivity = {}
+for layer_idx in range(7):
+    ax = axes_z[layer_idx]; name = layer_names[layer_idx]; ref = ref_thicknesses[layer_idx]
+    rmse_values = []
+    for delta in ZOOM_DELTA:
+        perturbed = ref_thicknesses.copy(); perturbed[layer_idx] = ref + delta
+        if perturbed[layer_idx] <= 0: rmse_values.append(np.nan); continue
+        rmse_values.append(compute_rmse_pct(ref_spectrum, simulator.calculate_spectrum(perturbed)))
+    rmse_values = np.array(rmse_values)
+    idx_10nm = np.where(np.isclose(ZOOM_DELTA, 10.0, atol=0.05))[0]
+    zoom_sensitivity[name] = {
+        'rmse_at_10nm': rmse_values[idx_10nm[0]] if len(idx_10nm) > 0 else np.nan,
+        'layer_idx': layer_idx, 'ref': ref
+    }
+    within = np.where(rmse_values <= ZOOM_Y_MAX)[0]
+    if len(within) > 0:
+        x_lo = max(ZOOM_DELTA[within[0]] - 1, ZOOM_DELTA[0])
+        x_hi = min(ZOOM_DELTA[within[-1]]+ 1, ZOOM_DELTA[-1])
+    else:
+        x_lo, x_hi = ZOOM_DELTA[0], ZOOM_DELTA[-1]
+    crop_mask = (ZOOM_DELTA >= x_lo) & (ZOOM_DELTA <= x_hi)
+    x_crop = ZOOM_DELTA[crop_mask]; y_crop = rmse_values[crop_mask]
+    ax.plot(x_crop, y_crop, 'b-', linewidth=2.5, label='RMSE%', zorder=3)
+    ax.axhline(y=5.0, color='orange', linestyle='--', linewidth=1.5, label='5% threshold')
+    ax.axhline(y=3.0, color='red',    linestyle=':',  linewidth=1.5, label='3% threshold')
+    ax.axvline(x=0,   color='grey',   linestyle=':',  linewidth=1,   alpha=0.6)
+    for thresh, color in [(5.0,'orange'), (3.0,'red')]:
+        w = np.where(y_crop <= thresh)[0]
+        if len(w) > 0:
+            ax.axvspan(x_crop[w[0]], x_crop[w[-1]], alpha=0.1, color=color)
+            ax.annotate(f'{x_crop[w[0]]:+.1f}nm',  xy=(x_crop[w[0]],  thresh),
+                        xytext=(x_crop[w[0]]-0.5,  thresh+0.3), fontsize=8, color=color, ha='right')
+            ax.annotate(f'{x_crop[w[-1]]:+.1f}nm', xy=(x_crop[w[-1]], thresh),
+                        xytext=(x_crop[w[-1]]+0.3, thresh+0.3), fontsize=8, color=color)
+    r10 = zoom_sensitivity[name]['rmse_at_10nm']
+    ax.set_xlim(x_lo, x_hi); ax.set_ylim(0, ZOOM_Y_MAX)
+    ax.set_xlabel('ΔL (nm)', fontsize=11); ax.set_ylabel('RMSE (%)', fontsize=11)
+    ax.set_title(f'Layer {layer_idx+1}: {name}  (ref={ref:.0f}nm)\nRMSE at ΔL=10nm: {r10:.2f}%', fontsize=11)
+    ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
+    ax.text(0.98, 0.05, f'ref = {ref:.0f} nm',
+            transform=ax.transAxes, fontsize=9,
+            color='white', ha='right', va='bottom',
+            bbox=dict(boxstyle='round', facecolor='#333333', alpha=0.7))
+axes_z[7].axis('off')
+# fig_z.suptitle('Sensitivity Analysis — Zoomed to 0-10% RMSE Region\nReference: SiO2=1000nm, Si3N4=100nm',
+               # fontsize=14, fontweight='bold')
+ref_label = '\n'.join([f'{layer_names[i]}: {ref_thicknesses[i]:.0f}nm'
+                       for i in range(7)])
+# fig_z.suptitle(f'Sensitivity Analysis — Zoomed to 0-10% RMSE Region\n'
+#                f'Reference thicknesses:\n{ref_label}',
+#                fontsize=13, fontweight='bold')
+fig_z.suptitle(f'Sensitivity Analysis — Zoomed to 0-10% RMSE Region\n{ref_title}',
+               fontsize=12, fontweight='bold')
+fig_z.tight_layout(); fig_z.savefig('./sensitivity_plots/sensitivity_zoomed.png', dpi=150, bbox_inches='tight')
+plt.show(); print('Saved: sensitivity_zoomed.png')
+
+# ── Printed table of exact ΔL crossing values ─────────────────────────────────
+print('\n' + '='*75)
+print('ΔL VALUES WHERE RMSE CROSSES 3% AND 5% THRESHOLDS')
+print('(Using linear interpolation between 0.1nm grid points for precision)')
+print('='*75)
+print(f'{"Layer":<16} {"Ref(nm)":>8} {"5% left cross":>15} {"5% right cross":>15} {"3% left cross":>15} {"3% right cross":>15}')
+print('-'*75)
+
+for layer_idx in range(7):
+    name = layer_names[layer_idx]
+    ref  = ref_thicknesses[layer_idx]
+
+    # Recompute RMSE for this layer (same as Cell 12)
+    rmse_vals = []
+    for delta in ZOOM_DELTA:
+        perturbed = ref_thicknesses.copy()
+        perturbed[layer_idx] = ref + delta
+        if perturbed[layer_idx] <= 0:
+            rmse_vals.append(np.nan); continue
+        rmse_vals.append(compute_rmse_pct(ref_spectrum,
+                         simulator.calculate_spectrum(perturbed)))
+    rmse_vals = np.array(rmse_vals)
+
+    def find_crossing(x_arr, y_arr, threshold, side='right'):
+        """
+        Linear interpolation to find exact x where y crosses threshold.
+        side='right': find first crossing going positive (ascending RMSE)
+        side='left' : find first crossing going negative (ascending RMSE)
+        """
+        if side == 'right':
+            mask = x_arr >= 0
+        else:
+            mask = x_arr <= 0
+            x_arr = x_arr[mask][::-1]   # flip so we go away from 0
+            y_arr = y_arr[mask][::-1]
+            x_arr = x_arr; y_arr = y_arr
+
+        x_s = x_arr[mask] if side == 'right' else x_arr
+        y_s = y_arr[mask] if side == 'right' else y_arr
+
+        above = y_s >= threshold
+        if not above.any():
+            return None   # never reaches threshold in this range
+        if above[0]:
+            return x_s[0]   # already above at ΔL=0 (unusual)
+
+        idx = np.where(above)[0][0]
+        # Linear interpolation between last below and first above
+        x1, x2 = x_s[idx-1], x_s[idx]
+        y1, y2 = y_s[idx-1], y_s[idx]
+        x_cross = x1 + (threshold - y1) * (x2 - x1) / (y2 - y1)
+        return x_cross
+
+    row_vals = [name, ref]
+    for thresh in [5.0, 3.0]:
+        # Left crossing (negative ΔL side)
+        x_left  = find_crossing(ZOOM_DELTA, rmse_vals, thresh, side='left')
+        # Right crossing (positive ΔL side)
+        x_right = find_crossing(ZOOM_DELTA, rmse_vals, thresh, side='right')
+
+        left_str  = f'{x_left:+.2f}nm'  if x_left  is not None else 'out of range'
+        right_str = f'{x_right:+.2f}nm' if x_right is not None else 'out of range'
+        row_vals += [left_str, right_str]
+
+    print(f'{row_vals[0]:<16} {row_vals[1]:>8.0f} {row_vals[2]:>15} {row_vals[3]:>15} {row_vals[4]:>15} {row_vals[5]:>15}')
+
+print('='*75)
+print('Positive values = thickness increase direction')
+print('Negative values = thickness decrease direction')
+
+# ── Cell 12b: Zoomed graphs — x-axis as ΔL% of reference thickness ────────────
+# Same as Cell 12 but x-axis shows ΔL as percentage of reference thickness
+# e.g. for SiO2 at 1000nm: 5nm change = 0.5%
+#      for Si3N4 at 100nm:  5nm change = 5.0%
+# This allows fair visual comparison across layers with different reference thicknesses
+
+print('\n=== Zoomed Sensitivity Graphs — Percentage x-axis ===')
+
+fig_zpct, axes_zpct = plt.subplots(4, 2, figsize=(14, 22))
+axes_zpct = axes_zpct.flatten()
+
+for layer_idx in range(7):
+    ax   = axes_zpct[layer_idx]
+    name = layer_names[layer_idx]
+    ref  = ref_thicknesses[layer_idx]
+
+    # Convert ZOOM_DELTA (nm) to percentage of reference
+    # ZOOM_DELTA already computed in Cell 12
+    pct_delta = ZOOM_DELTA / ref * 100.0   # e.g. 5nm on 1000nm ref = 0.5%
+
+    rmse_values = []
+    for delta in ZOOM_DELTA:
+        perturbed = ref_thicknesses.copy()
+        perturbed[layer_idx] = ref + delta
+        if perturbed[layer_idx] <= 0:
+            rmse_values.append(np.nan); continue
+        rmse_values.append(compute_rmse_pct(ref_spectrum,
+                           simulator.calculate_spectrum(perturbed)))
+    rmse_values = np.array(rmse_values)
+
+    # Crop x-axis to where RMSE <= ZOOM_Y_MAX (same logic as Cell 12 but in %)
+    within = np.where(rmse_values <= ZOOM_Y_MAX)[0]
+    if len(within) > 0:
+        x_lo_pct = max(pct_delta[within[0]]  - (1/ref*100), pct_delta[0])
+        x_hi_pct = min(pct_delta[within[-1]] + (1/ref*100), pct_delta[-1])
+    else:
+        x_lo_pct, x_hi_pct = pct_delta[0], pct_delta[-1]
+
+    crop_mask = (pct_delta >= x_lo_pct) & (pct_delta <= x_hi_pct)
+    x_crop_pct = pct_delta[crop_mask]
+    y_crop     = rmse_values[crop_mask]
+
+    ax.plot(x_crop_pct, y_crop, 'b-', linewidth=2.5, label='RMSE%', zorder=3)
+    ax.axhline(y=5.0, color='orange', linestyle='--', linewidth=1.5, label='5% threshold')
+    ax.axhline(y=3.0, color='red',    linestyle=':',  linewidth=1.5, label='3% threshold')
+    ax.axvline(x=0,   color='grey',   linestyle=':',  linewidth=1,   alpha=0.6)
+
+    for thresh, color in [(5.0,'orange'), (3.0,'red')]:
+        w = np.where(y_crop <= thresh)[0]
+        if len(w) > 0:
+            ax.axvspan(x_crop_pct[w[0]], x_crop_pct[w[-1]], alpha=0.1, color=color)
+            ax.annotate(f'{x_crop_pct[w[0]]:+.2f}%',
+                        xy=(x_crop_pct[w[0]], thresh),
+                        xytext=(x_crop_pct[w[0]]-0.05, thresh+0.3),
+                        fontsize=8, color=color, ha='right')
+            ax.annotate(f'{x_crop_pct[w[-1]]:+.2f}%',
+                        xy=(x_crop_pct[w[-1]], thresh),
+                        xytext=(x_crop_pct[w[-1]]+0.03, thresh+0.3),
+                        fontsize=8, color=color)
+
+    r10 = zoom_sensitivity[name]['rmse_at_10nm']
+    ax.set_xlim(x_lo_pct, x_hi_pct)
+    ax.set_ylim(0, ZOOM_Y_MAX)
+    ax.set_xlabel('ΔL / reference (%)', fontsize=11)
+    ax.set_ylabel('RMSE (%)', fontsize=11)
+    ax.set_title(f'Layer {layer_idx+1}: {name}  (ref = {ref:.0f} nm)\n'
+                 f'RMSE at ΔL=10nm: {r10:.2f}%', fontsize=11)
+
+    # Show reference thickness in corner
+    ax.text(0.98, 0.05, f'ref = {ref:.0f} nm',
+            transform=ax.transAxes, fontsize=9,
+            color='white', ha='right', va='bottom',
+            bbox=dict(boxstyle='round', facecolor='#333333', alpha=0.7))
+
+    ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
+
+axes_zpct[7].axis('off')
+ref_label = '  |  '.join([f'{layer_names[i]}: {ref_thicknesses[i]:.0f}nm' for i in range(7)])
+# fig_zpct.suptitle(f'Sensitivity Analysis — Zoomed, ΔL as % of Reference\n{ref_label}',
+#                   fontsize=12, fontweight='bold')
+fig_zpct.suptitle(f'Sensitivity Analysis — Zoomed, ΔL as % of Reference\n{ref_title}',
+                  fontsize=12, fontweight='bold')
+fig_zpct.tight_layout()
+fig_zpct.savefig('./sensitivity_plots/sensitivity_zoomed_pct.png', dpi=150, bbox_inches='tight')
+plt.show()
+print('Saved: sensitivity_zoomed_pct.png')
+
+# ==============================================================================
+# Cell 13: Find most and least sensitive layers
+# ==============================================================================
+sensitivity_ranking = sorted(zoom_sensitivity.items(), key=lambda x: x[1]['rmse_at_10nm'], reverse=True)
+print('\n=== Sensitivity Ranking (RMSE at ΔL=10nm) ===')
+for rank, (name, data) in enumerate(sensitivity_ranking, 1):
+    print(f'  Rank {rank}: {name:<16} ref={data["ref"]:.0f}nm  RMSE@10nm={data["rmse_at_10nm"]:.4f}%')
+
+layer1_name = sensitivity_ranking[0][0];  layer1_idx = sensitivity_ranking[0][1]['layer_idx'];  layer1_ref = sensitivity_ranking[0][1]['ref']
+layer2_name = sensitivity_ranking[1][0];  layer2_idx = sensitivity_ranking[1][1]['layer_idx'];  layer2_ref = sensitivity_ranking[1][1]['ref']
+least1_name = sensitivity_ranking[-1][0]; least1_idx = sensitivity_ranking[-1][1]['layer_idx']; least1_ref = sensitivity_ranking[-1][1]['ref']
+least2_name = sensitivity_ranking[-2][0]; least2_idx = sensitivity_ranking[-2][1]['layer_idx']; least2_ref = sensitivity_ranking[-2][1]['ref']
+print(f'\n→ Most sensitive:      {layer1_name}  |  Least sensitive: {least1_name}')
+print(f'→ 2nd most sensitive:  {layer2_name}  |  2nd least:       {least2_name}')
+
+
+# ==============================================================================
+# Cell 14: Heatmap — two most sensitive layers
+# ==============================================================================
+print(f'\n=== Heatmap: {layer1_name} vs {layer2_name} ===')
+lim1 = int(find_x_limit(simulator, ref_thicknesses, layer1_idx, layer1_ref)) + 1
+lim2 = int(find_x_limit(simulator, ref_thicknesses, layer2_idx, layer2_ref)) + 1
+print(f'Computing grid [{-lim1},{+lim1}]×[{-lim2},{+lim2}]nm...')
+da1, db1, hm1 = compute_heatmap(simulator, ref_thicknesses, ref_spectrum,
+                                  layer1_idx, layer1_ref, layer2_idx, layer2_ref, lim1, lim2)
+fig14, ax14 = plt.subplots(figsize=(10, 8))
+# plot_heatmap(ax14, da1, db1, hm1, layer1_name, layer2_name,
+#              f'2D Heatmap — Most Sensitive Layers\nY: {layer1_name} vs X: {layer2_name}')
+plot_heatmap(ax14, da1, db1, hm1, layer1_name, layer2_name,
+             f'2D Heatmap — Most Sensitive Layers\nY: {layer1_name} vs X: {layer2_name}\n{ref_title}')
+fig14.tight_layout(); fig14.savefig('./sensitivity_plots/heatmap_top2_layers.png', dpi=150, bbox_inches='tight')
+plt.show(); print('Saved: heatmap_top2_layers.png')
+
+# ==============================================================================
+# Cell 15: 1D comparison — all 7 layers on same graph, |ΔL| x-axis
+# ==============================================================================
+COMPARE_DELTA = np.arange(0, 20.1, 0.1)
+fig15, axes15 = plt.subplots(3, 2, figsize=(16, 18)); axes15 = axes15.flatten()
+for ex_idx, (ref_t, ex_label) in enumerate(test_examples):
+    ax = axes15[ex_idx]; ref_spec_ex = simulator.calculate_spectrum(ref_t)
+    for layer_idx in range(7):
+        name = layer_names[layer_idx]; ref = ref_t[layer_idx]
+        rmse_vals = []
+        for delta in COMPARE_DELTA:
+            perturbed = ref_t.copy(); perturbed[layer_idx] = ref + delta
+            if perturbed[layer_idx] <= 0: rmse_vals.append(np.nan); continue
+            rmse_vals.append(compute_rmse_pct(ref_spec_ex, simulator.calculate_spectrum(perturbed)))
+        ax.plot(COMPARE_DELTA, np.array(rmse_vals), color=colors_layers[layer_idx],
+                linestyle=linestyles[layer_idx], linewidth=2, label=f'{name} (ref={ref:.0f}nm)')
+    ax.axhline(y=5.0, color='orange', linestyle='--', linewidth=1, alpha=0.7, label='5%')
+    ax.axhline(y=3.0, color='red',    linestyle=':',  linewidth=1, alpha=0.7, label='3%')
+    ax.set_xlabel('|ΔL| (nm)', fontsize=11); ax.set_ylabel('RMSE (%)', fontsize=11)
+    ax.set_title(f'Example: {ex_label}', fontsize=11); ax.set_ylim(0, 30)
+    ax.legend(fontsize=7, loc='upper left'); ax.grid(True, alpha=0.3)
+axes15[5].axis('off')
+# fig15.suptitle('All 7 Layers — RMSE% vs |ΔL|', fontsize=14, fontweight='bold')
+fig15.suptitle(f'All 7 Layers — RMSE% vs |ΔL|\n{ref_title}',
+               fontsize=12, fontweight='bold')
+fig15.tight_layout(); fig15.savefig('./sensitivity_plots/comparison_all_layers_1d.png', dpi=150, bbox_inches='tight')
+plt.show(); print('Saved: comparison_all_layers_1d.png')
+
+
+# ==============================================================================
+# Cell 16: Normalised comparison — ΔL as % of reference thickness
+# ==============================================================================
+PCT_DELTA = np.arange(0, 5.1, 0.1)
+fig16, axes16 = plt.subplots(3, 2, figsize=(16, 18)); axes16 = axes16.flatten()
+for ex_idx, (ref_t, ex_label) in enumerate(test_examples):
+    ax = axes16[ex_idx]; ref_spec_ex = simulator.calculate_spectrum(ref_t)
+    for layer_idx in range(7):
+        name = layer_names[layer_idx]; ref = ref_t[layer_idx]
+        rmse_vals = []
+        for pct in PCT_DELTA:
+            delta_nm = pct / 100.0 * ref
+            perturbed = ref_t.copy(); perturbed[layer_idx] = ref + delta_nm
+            if perturbed[layer_idx] <= 0: rmse_vals.append(np.nan); continue
+            rmse_vals.append(compute_rmse_pct(ref_spec_ex, simulator.calculate_spectrum(perturbed)))
+        ax.plot(PCT_DELTA, np.array(rmse_vals), color=colors_layers[layer_idx],
+                linestyle=linestyles[layer_idx], linewidth=2, label=f'{name} (ref={ref:.0f}nm)')
+    ax.axhline(y=5.0, color='orange', linestyle='--', linewidth=1, alpha=0.7)
+    ax.axhline(y=3.0, color='red',    linestyle=':',  linewidth=1, alpha=0.7)
+    ax.set_xlabel('|ΔL| / reference (%) — normalised', fontsize=10)
+    ax.set_ylabel('RMSE (%)', fontsize=11); ax.set_title(f'Example: {ex_label}', fontsize=11)
+    ax.set_ylim(0, 30); ax.legend(fontsize=7, loc='upper left'); ax.grid(True, alpha=0.3)
+axes16[5].axis('off')
+# fig16.suptitle('Normalised Comparison — RMSE% vs ΔL as % of Reference Thickness\n'
+#                'Fair comparison between SiO2 and Si3N4 layers', fontsize=13, fontweight='bold')
+fig16.suptitle(f'Normalised Comparison — RMSE% vs ΔL as % of Reference\n{ref_title}',
+               fontsize=12, fontweight='bold')
+fig16.tight_layout(); fig16.savefig('./sensitivity_plots/comparison_normalised_pct.png', dpi=150, bbox_inches='tight')
+plt.show(); print('Saved: comparison_normalised_pct.png')
+
+
+# ==============================================================================
+# Cell 17: Sensitivity coefficient (系数) bar chart
+# ==============================================================================
+FIT_DELTA = np.arange(0, 10.1, 0.1)
+ex_labels_short = ['Original', 'Half', 'Equal', 'Mixed A', 'Mixed B']
+coeff_quad = {name: [] for name in layer_names}
+coeff_lin  = {name: [] for name in layer_names}
+
+for ex_idx, (ref_t, ex_label) in enumerate(test_examples):
+    ref_spec_ex = simulator.calculate_spectrum(ref_t)
+    for layer_idx in range(7):
+        name = layer_names[layer_idx]; ref = ref_t[layer_idx]
+        rmse_vals = []
+        for delta in FIT_DELTA:
+            perturbed = ref_t.copy(); perturbed[layer_idx] = ref + delta
+            if perturbed[layer_idx] <= 0: rmse_vals.append(np.nan); continue
+            rmse_vals.append(compute_rmse_pct(ref_spec_ex, simulator.calculate_spectrum(perturbed)))
+        rmse_vals = np.array(rmse_vals); mask = ~np.isnan(rmse_vals)
+        try:
+            popt, _ = curve_fit(quadratic_full, FIT_DELTA[mask], rmse_vals[mask], p0=[0.1, 0])
+            coeff_quad[name].append(popt[0])
+        except: coeff_quad[name].append(0)
+        try:
+            popt, _ = curve_fit(linear_abs, FIT_DELTA[mask], rmse_vals[mask], p0=[0.5, 0])
+            coeff_lin[name].append(popt[0])
+        except: coeff_lin[name].append(0)
+
+fig17, axes17 = plt.subplots(2, 1, figsize=(14, 14))
+x_pos = np.arange(len(ex_labels_short)); bar_w = 0.11; offsets = np.linspace(-(3*bar_w), 3*bar_w, 7)
+for layer_idx, name in enumerate(layer_names):
+    axes17[0].bar(x_pos+offsets[layer_idx], coeff_quad[name], bar_w,
+                  label=name, color=colors_layers[layer_idx], alpha=0.85)
+    axes17[1].bar(x_pos+offsets[layer_idx], coeff_lin[name],  bar_w,
+                  label=name, color=colors_layers[layer_idx], alpha=0.85)
+for ax17, title, ylabel in zip(axes17,
+    ['Sensitivity Coefficient (系数) — Quadratic Fit\nHigher = more sensitive',
+     'Sensitivity Coefficient (系数) — Linear Fit\nHigher = more sensitive'],
+    ['Quadratic coeff a in RMSE = a×ΔL² + b', 'Linear coeff a in RMSE = a×|ΔL| + b']):
+    ax17.set_xticks(x_pos); ax17.set_xticklabels(ex_labels_short)
+    ax17.set_ylabel(ylabel, fontsize=10); ax17.set_title(title, fontsize=12)
+    ax17.legend(fontsize=8, loc='upper right'); ax17.grid(True, alpha=0.3, axis='y')
+# fig17.suptitle('Layer Sensitivity Coefficients Across All Reference Examples', fontsize=13, fontweight='bold')
+fig17.suptitle(f'Layer Sensitivity Coefficients (系数) Across All Reference Examples\n{ref_title}',
+               fontsize=12, fontweight='bold')
+fig17.tight_layout(); fig17.savefig('./sensitivity_plots/sensitivity_coefficients.png', dpi=150, bbox_inches='tight')
+plt.show(); print('Saved: sensitivity_coefficients.png')
+
+
+# ==============================================================================
+# Cell 18: Heatmaps — least sensitive layers, multiple examples
+# ==============================================================================
+print(f'\n=== Heatmaps — Least Sensitive: {least1_name} vs {least2_name} ===')
+heatmap_examples = test_examples[:3]
+fig18, axes18 = plt.subplots(1, 3, figsize=(20, 6))
+for ex_idx, (ref_t, ex_label) in enumerate(heatmap_examples):
+    ax = axes18[ex_idx]
+    ref_spec_ex = simulator.calculate_spectrum(ref_t)
+    ref_a = ref_t[least1_idx]; ref_b = ref_t[least2_idx]
+    lim_a = int(find_x_limit(simulator, ref_t, least1_idx, ref_a)) + 1
+    lim_b = int(find_x_limit(simulator, ref_t, least2_idx, ref_b)) + 1
+    print(f'Example {ex_idx+1}: {ex_label} — grid [{-lim_a},{+lim_a}]×[{-lim_b},{+lim_b}]nm...')
+    da, db, hm = compute_heatmap(simulator, ref_t, ref_spec_ex,
+                                  least1_idx, ref_a, least2_idx, ref_b, lim_a, lim_b)
+    ci = len(da)//2; cj = len(db)//2
+    row_mono = bool(np.all(np.diff(hm[ci, cj:]) >= 0))
+    col_mono = bool(np.all(np.diff(hm[ci:, cj]) >= 0))
+    mono_str = '✅ Monotonic' if (row_mono and col_mono) else '⚠️ Not fully monotonic'
+    print(f'  {mono_str}')
+    plot_heatmap(ax, da, db, hm, least1_name, least2_name, f'{ex_label}\n{mono_str}', ZOOM_Y_MAX)
+# fig18.suptitle(f'Heatmap — Least Sensitive: {least1_name} vs {least2_name}  |  3 Examples',
+#                fontsize=13, fontweight='bold')
+fig18.suptitle(f'Heatmap — Least Sensitive: {least1_name} vs {least2_name}\n{ref_title}',
+               fontsize=12, fontweight='bold')
+fig18.tight_layout(); fig18.savefig('./sensitivity_plots/heatmap_least_sensitive.png', dpi=150, bbox_inches='tight')
+plt.show(); print('Saved: heatmap_least_sensitive.png')
+
+print('\nAll done! Check ./sensitivity_plots/ for all saved figures.')
