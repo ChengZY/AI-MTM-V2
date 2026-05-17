@@ -176,10 +176,10 @@ def plot_heatmap(ax, da, db, hm, name_a, name_b, title, zoom_y_max=10.0):
 # ==============================================================================
 # Setup — initialise simulator and shared variables
 # ==============================================================================
-# Define once, use in every graph title
 ref_thicknesses = [1000.0, 100.0, 1000.0, 100.0, 1000.0, 100.0, 1000.0]
 layer_names     = ['thk_SiO2_1', 'thk_Si3N4_1', 'thk_SiO2_2',
                    'thk_Si3N4_2', 'thk_SiO2_3',  'thk_Si3N4_3', 'thk_SiO2_4']
+# Define once, use in every graph title
 ref_title = '  |  '.join([f'{layer_names[i]}: {ref_thicknesses[i]:.0f}nm'
                            for i in range(7)])
 # Result: "thk_SiO2_1: 1000nm  |  thk_Si3N4_1: 100nm  |  ..."
