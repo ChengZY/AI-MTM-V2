@@ -179,14 +179,15 @@ def plot_heatmap(ax, da, db, hm, name_a, name_b, title, zoom_y_max=10.0):
 ref_thicknesses = [1000.0, 100.0, 1000.0, 100.0, 1000.0, 100.0, 1000.0]
 layer_names     = ['thk_SiO2_1', 'thk_Si3N4_1', 'thk_SiO2_2',
                    'thk_Si3N4_2', 'thk_SiO2_3',  'thk_Si3N4_3', 'thk_SiO2_4']
-# Define once, use in every graph title
+
+# Define once here, reuse in all graph titles
 ref_title = '  |  '.join([f'{layer_names[i]}: {ref_thicknesses[i]:.0f}nm'
                            for i in range(7)])
-# Result: "thk_SiO2_1: 1000nm  |  thk_Si3N4_1: 100nm  |  ..."
-simulator = TMM_Simulator_7Layer(data_dir='.')  # change path to your data folder
 
-# ── test_examples defined ONCE as tuples (thicknesses, label) ─────────────────
-# Used consistently in ALL cells below — no need for a separate example_labels list
+simulator = TMM_Simulator_7Layer(data_dir='.')
+
+# test_examples defined ONCE as tuples (thicknesses, label)
+# Used consistently in ALL cells below
 test_examples = [
     ([1000.0, 100.0, 1000.0, 100.0, 1000.0, 100.0, 1000.0], 'SiO2=1000, Si3N4=100 (original)'),
     ([500.0,   50.0,  500.0,  50.0,  500.0,  50.0,  500.0], 'SiO2=500,  Si3N4=50  (half)'),
@@ -194,7 +195,6 @@ test_examples = [
     ([800.0,  150.0,  600.0, 120.0,  400.0,  80.0,  700.0], 'Mixed A'),
     ([300.0,   80.0,  450.0,  60.0,  600.0, 110.0,  250.0], 'Mixed B'),
 ]
-
 delta_range_nm  = np.arange(-100, 101, 1)
 delta_range_pct = np.arange(-50,   51, 1)
 threshold_1     = 5.0
