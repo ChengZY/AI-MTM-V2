@@ -1,4 +1,5 @@
-%matplotlib inline
+#Uncomment next line if running in jupyter notebook
+#%matplotlib inline
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -118,6 +119,37 @@ def check_monotonic(delta_range, rmse_values, threshold):
         idx = np.argsort(delta_r[right_mask])
         right_ok = bool(np.all(np.diff(rmse_r[right_mask][idx]) >= 0))
     return left_ok and right_ok, left_ok, right_ok
+
+def find_crossing(x_arr, y_arr, threshold, side='right'):
+    """
+    Linear interpolation to find exact x where y crosses threshold.
+    side='right': find first crossing going positive (ascending RMSE)
+    side='left' : find first crossing going negative (ascending RMSE)
+    """
+    if side == 'right':
+        mask = x_arr >= 0
+    else:
+        mask = x_arr <= 0
+        x_arr = x_arr[mask][::-1]   # flip so we go away from 0
+        y_arr = y_arr[mask][::-1]
+        x_arr = x_arr; y_arr = y_arr
+
+    x_s = x_arr[mask] if side == 'right' else x_arr
+    y_s = y_arr[mask] if side == 'right' else y_arr
+
+    above = y_s >= threshold
+    if not above.any():
+        return None   # never reaches threshold in this range
+    if above[0]:
+        return x_s[0]   # already above at ΔL=0 (unusual)
+
+    idx = np.where(above)[0][0]
+    # Linear interpolation between last below and first above
+    x1, x2 = x_s[idx-1], x_s[idx]
+    y1, y2 = y_s[idx-1], y_s[idx]
+    x_cross = x1 + (threshold - y1) * (x2 - x1) / (y2 - y1)
+    return x_cross
+
 
 def find_x_limit(simulator, ref_thicknesses, layer_idx, ref_thickness,
                  max_rmse=10.0, delta_check=np.arange(-50, 51, 1)):
@@ -239,8 +271,6 @@ for layer_idx in range(7):
 axes1[7].axis('off')
 fig1.suptitle(f'Sensitivity Analysis — 1nm Step Resolution\n{ref_title}',
               fontsize=12, fontweight='bold')
-# fig1.suptitle('Sensitivity Analysis — 1nm Step Resolution\nReference: SiO2=1000nm, Si3N4=100nm',
-#               fontsize=14, fontweight='bold')
 fig1.tight_layout(); fig1.savefig('./sensitivity_plots/sensitivity_1nm_step.png', dpi=150, bbox_inches='tight')
 plt.show(); print("Saved: sensitivity_1nm_step.png")
 
@@ -294,8 +324,6 @@ for layer_idx in range(7):
     ax.legend(fontsize=9); ax.grid(True, alpha=0.3)
     print(f"  {name} done")
 axes2[7].axis('off')
-# fig2.suptitle('Sensitivity Analysis — 1% Step Resolution\nReference: SiO2=1000nm, Si3N4=100nm',
-#               fontsize=14, fontweight='bold')
 fig2.suptitle(f'Sensitivity Analysis — 1% Step Resolution\n{ref_title}',
               fontsize=12, fontweight='bold')
 fig2.tight_layout(); fig2.savefig('./sensitivity_plots/sensitivity_1pct_step.png', dpi=150, bbox_inches='tight')
@@ -374,8 +402,6 @@ for ex_idx, (ref_t, ex_label) in enumerate(test_examples):
     ax.set_ylim(0, MONO_THRESH+0.5); ax.set_xlim(0, MONO_DELTA[-1])
     ax.legend(fontsize=7, loc='upper left'); ax.grid(True, alpha=0.2, color='white')
 axes_mono[5].axis('off')
-# fig_mono.suptitle('Visual Monotonicity Check — |ΔL|\nGreen = all monotonic ✅  |  Red = issue ❌',
-#                   fontsize=13, fontweight='bold')
 fig_mono.suptitle(f'Visual Monotonicity Check — |ΔL|\n{ref_title}\n'
                   f'Green = all monotonic ✅  |  Red = issue ❌',
                   fontsize=11, fontweight='bold')
@@ -422,10 +448,6 @@ for ex_idx, (ref_t, ex_label) in enumerate(test_examples):
         ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
     axes_m[7].axis('off')
     overall_status = '✅ All monotonic' if example_all_mono else '❌ Some non-monotonic!'
-    # fig_m.suptitle(f'Monotonicity Check — Example {ex_idx+1}: {ex_label}\n'
-    #                f'Within 0–{MONO_THRESH}% RMSE region   |   {overall_status}',
-    #                fontsize=13, fontweight='bold')
-    # Inside the for loop, replace fig_m.suptitle(...) with:
     ref_title_ex = '  |  '.join([f'{layer_names[i]}: {ref_t[i]:.0f}nm'
                                   for i in range(7)])
     fig_m.suptitle(f'Monotonicity Check — Example {ex_idx+1}: {ex_label}\n'
@@ -489,13 +511,6 @@ for layer_idx in range(7):
             color='white', ha='right', va='bottom',
             bbox=dict(boxstyle='round', facecolor='#333333', alpha=0.7))
 axes_z[7].axis('off')
-# fig_z.suptitle('Sensitivity Analysis — Zoomed to 0-10% RMSE Region\nReference: SiO2=1000nm, Si3N4=100nm',
-               # fontsize=14, fontweight='bold')
-ref_label = '\n'.join([f'{layer_names[i]}: {ref_thicknesses[i]:.0f}nm'
-                       for i in range(7)])
-# fig_z.suptitle(f'Sensitivity Analysis — Zoomed to 0-10% RMSE Region\n'
-#                f'Reference thicknesses:\n{ref_label}',
-#                fontsize=13, fontweight='bold')
 fig_z.suptitle(f'Sensitivity Analysis — Zoomed to 0-10% RMSE Region\n{ref_title}',
                fontsize=12, fontweight='bold')
 fig_z.tight_layout(); fig_z.savefig('./sensitivity_plots/sensitivity_zoomed.png', dpi=150, bbox_inches='tight')
@@ -523,37 +538,6 @@ for layer_idx in range(7):
         rmse_vals.append(compute_rmse_pct(ref_spectrum,
                          simulator.calculate_spectrum(perturbed)))
     rmse_vals = np.array(rmse_vals)
-
-    def find_crossing(x_arr, y_arr, threshold, side='right'):
-        """
-        Linear interpolation to find exact x where y crosses threshold.
-        side='right': find first crossing going positive (ascending RMSE)
-        side='left' : find first crossing going negative (ascending RMSE)
-        """
-        if side == 'right':
-            mask = x_arr >= 0
-        else:
-            mask = x_arr <= 0
-            x_arr = x_arr[mask][::-1]   # flip so we go away from 0
-            y_arr = y_arr[mask][::-1]
-            x_arr = x_arr; y_arr = y_arr
-
-        x_s = x_arr[mask] if side == 'right' else x_arr
-        y_s = y_arr[mask] if side == 'right' else y_arr
-
-        above = y_s >= threshold
-        if not above.any():
-            return None   # never reaches threshold in this range
-        if above[0]:
-            return x_s[0]   # already above at ΔL=0 (unusual)
-
-        idx = np.where(above)[0][0]
-        # Linear interpolation between last below and first above
-        x1, x2 = x_s[idx-1], x_s[idx]
-        y1, y2 = y_s[idx-1], y_s[idx]
-        x_cross = x1 + (threshold - y1) * (x2 - x1) / (y2 - y1)
-        return x_cross
-
     row_vals = [name, ref]
     for thresh in [5.0, 3.0]:
         # Left crossing (negative ΔL side)
@@ -648,9 +632,6 @@ for layer_idx in range(7):
     ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
 
 axes_zpct[7].axis('off')
-ref_label = '  |  '.join([f'{layer_names[i]}: {ref_thicknesses[i]:.0f}nm' for i in range(7)])
-# fig_zpct.suptitle(f'Sensitivity Analysis — Zoomed, ΔL as % of Reference\n{ref_label}',
-#                   fontsize=12, fontweight='bold')
 fig_zpct.suptitle(f'Sensitivity Analysis — Zoomed, ΔL as % of Reference\n{ref_title}',
                   fontsize=12, fontweight='bold')
 fig_zpct.tight_layout()
@@ -684,8 +665,6 @@ print(f'Computing grid [{-lim1},{+lim1}]×[{-lim2},{+lim2}]nm...')
 da1, db1, hm1 = compute_heatmap(simulator, ref_thicknesses, ref_spectrum,
                                   layer1_idx, layer1_ref, layer2_idx, layer2_ref, lim1, lim2)
 fig14, ax14 = plt.subplots(figsize=(10, 8))
-# plot_heatmap(ax14, da1, db1, hm1, layer1_name, layer2_name,
-#              f'2D Heatmap — Most Sensitive Layers\nY: {layer1_name} vs X: {layer2_name}')
 plot_heatmap(ax14, da1, db1, hm1, layer1_name, layer2_name,
              f'2D Heatmap — Most Sensitive Layers\nY: {layer1_name} vs X: {layer2_name}\n{ref_title}')
 fig14.tight_layout(); fig14.savefig('./sensitivity_plots/heatmap_top2_layers.png', dpi=150, bbox_inches='tight')
@@ -713,7 +692,6 @@ for ex_idx, (ref_t, ex_label) in enumerate(test_examples):
     ax.set_title(f'Example: {ex_label}', fontsize=11); ax.set_ylim(0, 30)
     ax.legend(fontsize=7, loc='upper left'); ax.grid(True, alpha=0.3)
 axes15[5].axis('off')
-# fig15.suptitle('All 7 Layers — RMSE% vs |ΔL|', fontsize=14, fontweight='bold')
 fig15.suptitle(f'All 7 Layers — RMSE% vs |ΔL|\n{ref_title}',
                fontsize=12, fontweight='bold')
 fig15.tight_layout(); fig15.savefig('./sensitivity_plots/comparison_all_layers_1d.png', dpi=150, bbox_inches='tight')
@@ -743,8 +721,6 @@ for ex_idx, (ref_t, ex_label) in enumerate(test_examples):
     ax.set_ylabel('RMSE (%)', fontsize=11); ax.set_title(f'Example: {ex_label}', fontsize=11)
     ax.set_ylim(0, 30); ax.legend(fontsize=7, loc='upper left'); ax.grid(True, alpha=0.3)
 axes16[5].axis('off')
-# fig16.suptitle('Normalised Comparison — RMSE% vs ΔL as % of Reference Thickness\n'
-#                'Fair comparison between SiO2 and Si3N4 layers', fontsize=13, fontweight='bold')
 fig16.suptitle(f'Normalised Comparison — RMSE% vs ΔL as % of Reference\n{ref_title}',
                fontsize=12, fontweight='bold')
 fig16.tight_layout(); fig16.savefig('./sensitivity_plots/comparison_normalised_pct.png', dpi=150, bbox_inches='tight')
@@ -792,7 +768,6 @@ for ax17, title, ylabel in zip(axes17,
     ax17.set_xticks(x_pos); ax17.set_xticklabels(ex_labels_short)
     ax17.set_ylabel(ylabel, fontsize=10); ax17.set_title(title, fontsize=12)
     ax17.legend(fontsize=8, loc='upper right'); ax17.grid(True, alpha=0.3, axis='y')
-# fig17.suptitle('Layer Sensitivity Coefficients Across All Reference Examples', fontsize=13, fontweight='bold')
 fig17.suptitle(f'Layer Sensitivity Coefficients (系数) Across All Reference Examples\n{ref_title}',
                fontsize=12, fontweight='bold')
 fig17.tight_layout(); fig17.savefig('./sensitivity_plots/sensitivity_coefficients.png', dpi=150, bbox_inches='tight')
@@ -820,8 +795,6 @@ for ex_idx, (ref_t, ex_label) in enumerate(heatmap_examples):
     mono_str = '✅ Monotonic' if (row_mono and col_mono) else '⚠️ Not fully monotonic'
     print(f'  {mono_str}')
     plot_heatmap(ax, da, db, hm, least1_name, least2_name, f'{ex_label}\n{mono_str}', ZOOM_Y_MAX)
-# fig18.suptitle(f'Heatmap — Least Sensitive: {least1_name} vs {least2_name}  |  3 Examples',
-#                fontsize=13, fontweight='bold')
 fig18.suptitle(f'Heatmap — Least Sensitive: {least1_name} vs {least2_name}\n{ref_title}',
                fontsize=12, fontweight='bold')
 fig18.tight_layout(); fig18.savefig('./sensitivity_plots/heatmap_least_sensitive.png', dpi=150, bbox_inches='tight')
